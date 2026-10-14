@@ -38,6 +38,19 @@
 #define PATHFMT "%s"
 #endif
 
+#ifdef _WIN32
+// The section object that backs the first mem_size bytes of rdram.
+static HANDLE rdram_section = nullptr;
+#endif
+
+void* recomp::get_rdram_section() {
+#ifdef _WIN32
+    return rdram_section;
+#else
+    return nullptr;
+#endif
+}
+
 enum GameStatus {
     None,
     Running,
@@ -841,15 +854,30 @@ void recomp::start(
     uint8_t* rdram;
     bool alloc_failed;
 #ifdef _WIN32
-    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
-    DWORD old_protect = 0;
-    alloc_failed = (rdram == nullptr);
+    // Reserve the whole block as a placeholder and map one shared section over the first
+    // mem_size bytes. Unlike plain VirtualAlloc memory, a section can be mapped a second
+    // time elsewhere in the block. The rest stays a placeholder, so invalid addresses
+    // still fault. VirtualAlloc2 and MapViewOfFile3 (Windows 10 version 1803 and newer)
+    // are not in kernel32.lib, so they are looked up by name.
+    using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+    using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    auto virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(reinterpret_cast<void*>(GetProcAddress(kernelbase, "VirtualAlloc2")));
+    auto map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(reinterpret_cast<void*>(GetProcAddress(kernelbase, "MapViewOfFile3")));
+    rdram = nullptr;
+    if (virtual_alloc2 != nullptr && map_view_of_file3 != nullptr) {
+        rdram_section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+            static_cast<DWORD>(mem_size >> 32), static_cast<DWORD>(mem_size), nullptr);
+        rdram = static_cast<uint8_t*>(virtual_alloc2(nullptr, nullptr, allocation_size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+    }
+    alloc_failed = (rdram == nullptr || rdram_section == nullptr);
     if (!alloc_failed) {
-        // VirtualProtect returns 0 on failure.
-        alloc_failed = (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
-        if (alloc_failed) {
-            VirtualFree(rdram, 0, MEM_RELEASE);
-        }
+        // Split off the first mem_size bytes of the placeholder, then put the section there.
+        alloc_failed =
+            VirtualFree(rdram, mem_size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0 ||
+            map_view_of_file3(rdram_section, nullptr, rdram, 0, mem_size,
+                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != rdram;
     }
 #else
     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -902,8 +930,9 @@ void recomp::start(
     // Free rdram.
     bool free_failed;
 #ifdef _WIN32
-    // VirtualFree returns zero on failure.
-    free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+    // UnmapViewOfFile returns zero on failure. The placeholders above the view, and any
+    // views a game mapped there, are released when the process exits.
+    free_failed = (UnmapViewOfFile(rdram) == 0);
 #else
     // munmap returns -1 on failure.
     free_failed = (munmap(rdram, allocation_size) == -1);

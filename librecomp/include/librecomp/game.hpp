@@ -117,6 +117,14 @@ namespace recomp {
         const ultramodern::threads::callbacks_t& threads_callbacks
     );
 
+    /**
+     * Windows only: the section object that backs the first `mem_size` bytes of rdram.
+     * A game can map parts of it a second time inside the rdram block, for example to
+     * emulate N64 TLB mappings. Returns `nullptr` on other platforms, and before
+     * `recomp::start` has allocated rdram.
+     */
+    void* get_rdram_section();
+
     SaveType get_save_type();
     bool eeprom_allowed();
     bool sram_allowed();
